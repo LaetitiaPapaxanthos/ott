@@ -269,8 +269,6 @@ class QuadraticProblem:
       marginal_1: jnp.ndarray,
       marginal_2: jnp.ndarray,
       epsilon: float,
-      rescale_factor: float,
-      delta: float = 1e-9
   ) -> float:
     r"""Calculate cost term from the quadratic divergence when unbalanced.
 
