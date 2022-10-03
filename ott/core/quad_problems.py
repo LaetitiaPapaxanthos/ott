@@ -305,18 +305,16 @@ class QuadraticProblem:
     """
 
     def regulariser(tau: float) -> float:
-      return tau / (1.0 - tau) if tau != 1.0 else 0
+      return epsilon._target_init * tau / (1.0 - tau) if tau != 1.0 else 0
 
-    cost = regulariser(self.tau_a) * jax.scipy.special.xlogy(
-        marginal_1, rescale_factor * marginal_1 / jnp.clip(self.a, a_min=delta)
-    ).sum()
-    cost += regulariser(self.tau_b) * jax.scipy.special.xlogy(
-        marginal_2, rescale_factor * marginal_2 / jnp.clip(self.b, a_min=delta)
-    ).sum()
-    cost += epsilon * jax.scipy.special.xlogy(
-        transport_matrix, rescale_factor * transport_matrix /
-        jnp.clip(self.a[:, None] * self.b[None, :], a_min=delta)
-    ).sum()
+    marginal_1loga = jax.scipy.special.xlogy(marginal_1, self.a).sum()
+    marginal_2logb = jax.scipy.special.xlogy(marginal_2, self.b).sum()
+    cost = regulariser(self.tau_a) * (-jax.scipy.special.entr(
+        marginal_1).sum() - marginal_1loga)
+    cost += regulariser(self.tau_b) * (-jax.scipy.special.entr(
+        marginal_2).sum() - marginal_2logb)
+    cost += epsilon._target_init * jax.scipy.special.xlogy(
+      transport_matrix, transport_matrix).sum()
     return cost
 
   def init_transport(self) -> jnp.ndarray:
@@ -325,8 +323,7 @@ class QuadraticProblem:
     a = jax.lax.stop_gradient(self.a)
     b = jax.lax.stop_gradient(self.b)
     return (
-        a[:, None] * b[None, :] if self.is_balanced else a[:, None] *
-        b[None, :] / jnp.sqrt(a.sum() * b.sum())
+        a[:, None] * b[None, :]
     )
 
   def init_transport_mass(self) -> float:
@@ -339,8 +336,7 @@ class QuadraticProblem:
     b = jax.lax.stop_gradient(self.b)
     transport_mass = a.sum() * b.sum()
     return (
-        transport_mass if self.is_balanced else transport_mass /
-        jnp.sqrt(transport_mass)
+        transport_mass
     )
 
   def init_linearization(
@@ -394,19 +390,16 @@ class QuadraticProblem:
     marginal_cost = self.marginal_dependent_cost(marginal_1, marginal_2)
 
     if not self.is_balanced:
+      transport_mass = marginal_1.sum()
+      # Initialises epsilon for Unbalanced GW according to Sejourne et al (2021)
+      epsilon = update_epsilon_unbalanced(epsilon, transport_mass)
       unbalanced_correction = self.cost_unbalanced_correction(
-          tmp, marginal_1, marginal_2, epsilon, 1.0
-      )
+          tmp, marginal_1, marginal_2, epsilon)
 
     h1, h2 = self.quad_loss
     tmp = apply_cost(self.geom_xx, tmp, axis=1, fn=h1)
     tmp = apply_cost(self.geom_yy, tmp.T, axis=1, fn=h2).T
     cost_matrix = (marginal_cost.cost_matrix - tmp + unbalanced_correction)
-
-    # Initialises epsilon for Unbalanced GW according to Sejourne et al (2021).
-    if not self.is_balanced:
-      transport_mass = marginal_1.sum()
-      epsilon = update_epsilon_unbalanced(epsilon, transport_mass)
 
     cost_matrix += self.fused_penalty * self._fused_cost_matrix
 
@@ -492,27 +485,30 @@ class QuadraticProblem:
     rescale_factor = 1.0
     unbalanced_correction = 0.0
 
-    marginal_1 = transport.marginal(axis=1)
-    marginal_2 = transport.marginal(axis=0)
+    if not self.is_balanced:
+      marginal_1 = transport.marginal(axis=1)
+      transport_mass = jax.lax.stop_gradient(marginal_1.sum())
+      rescale_factor = jnp.sqrt(old_transport_mass / transport_mass)
+
+    marginal_1 = transport.marginal(axis=1) * rescale_factor
+    marginal_2 = transport.marginal(axis=0) * rescale_factor
     marginal_cost = self.marginal_dependent_cost(marginal_1, marginal_2)
+
+    transport_matrix = transport.matrix * rescale_factor
 
     if not self.is_balanced:
       # Rescales transport for Unbalanced GW according to Sejourne et al (2021).
       transport_mass = jax.lax.stop_gradient(marginal_1.sum())
-      rescale_factor = jnp.sqrt(old_transport_mass / transport_mass)
-      unbalanced_correction = self.cost_unbalanced_correction(
-          transport.matrix, marginal_1, marginal_2, epsilon, rescale_factor
-      )
-      # Updates epsilon for Unbalanced GW.
       epsilon = update_epsilon_unbalanced(epsilon, transport_mass)
+      unbalanced_correction = self.cost_unbalanced_correction(
+          transport_matrix, marginal_1, marginal_2, epsilon)
 
     h1, h2 = self.quad_loss
-    tmp = apply_cost(self.geom_xx, transport.matrix, axis=1, fn=h1)
+    tmp = apply_cost(self.geom_xx, transport_matrix, axis=1, fn=h1)
     tmp = apply_cost(self.geom_yy, tmp.T, axis=1, fn=h2).T
 
     cost_matrix = marginal_cost.cost_matrix - tmp + unbalanced_correction
-    cost_matrix += self.fused_penalty * self._fused_cost_matrix
-    cost_matrix *= rescale_factor
+    cost_matrix += self.fused_penalty * self._fused_cost_matrix * rescale_factor
 
     geom = geometry.Geometry(cost_matrix=cost_matrix, epsilon=epsilon)
     return linear_problems.LinearProblem(
